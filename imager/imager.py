@@ -706,11 +706,123 @@ def gpp_f(xi_w, meas, sigma, lam, cov, chol_cov, cov_diag, sys_mat, kronecker):
     #print(x.shape)
     # print(f"ll loss:{loss_ll:.2f}, lp loss{loss_lp:.2f}, total loss{loss_ll+loss_lp:.2f}")
 
-    return (loss_ll + loss_lp, grad.ravel())
+    # ---- PATCH START ----
+    # Ensure scalar loss is Python float
+    total_loss = float(loss_ll + loss_lp)
 
+    # Ensure gradient is 1D float64 Fortran-contiguous array
+    grad = np.asarray(grad, dtype=np.float64).ravel(order="F")
+    grad = np.asfortranarray(grad)
+
+    # Safety checks
+    if grad.ndim != 1:
+        raise ValueError(f"Gradient must be 1D, got shape {grad.shape}")
+    if grad.size != xi_w.size:
+        raise ValueError(f"Gradient length {grad.size} != parameter length {xi_w.size}")
+    # ---- PATCH END ----
+
+    return (total_loss, grad.ravel())
 
 
 def inv_link(lam, xi, cov, cov_diag=None):
     cov_diag = cov_diag if cov_diag is not None else np.reshape(np.diag(cov), (-1, 1))
     # log_ndtr for numerical stability instead of the error funciton
     return -1 / lam * log_ndtr(-xi)
+
+
+def gpp_f_with_b(theta, meas, sigma, lam, cov, chol_cov, cov_diag,
+                       sys_mat, measurement_time, kronecker,
+                       b_prior_mean=None, b_prior_std=None):
+    """
+    theta: concatenated parameter vector [xi_w (n_vox), b_tilde (1)]
+    b = exp(b_tilde) >= 0
+    """
+    theta = np.asarray(theta)
+    n_vox = chol_cov.shape[0] if not kronecker else cov.shape[0]
+
+    xi_w    = theta[:n_vox]
+    b_tilde = float(theta[n_vox])
+    b       = np.exp(b_tilde)  # ensure non-negativity
+
+    # shapes (flatten to 1D where useful)
+    meas = np.asarray(meas)
+    if meas.ndim == 2 and meas.shape[1] == 1:
+        meas = meas.ravel()
+    measurement_time = np.asarray(measurement_time)
+    if measurement_time.ndim == 2 and measurement_time.shape[1] == 1:
+        measurement_time = measurement_time.ravel()
+
+    # latent -> xi -> x
+    xi = chol_cov @ xi_w.reshape(-1, 1)
+    xi = xi.reshape(-1, 1) if kronecker else xi
+    x  = inv_link(lam, xi, cov, cov_diag=cov_diag)  # (n_vox, 1) or (n_vox,)
+
+    # forward model with background
+    fp = sys_mat @ x                                  # (n_poses, 1) or (n_poses,)
+    fp = fp.reshape(-1) + b * measurement_time        # make 1D for algebra
+
+    # guard against invalid Poisson means
+    if np.any(fp <= 0):
+        # huge penalty and zero grad (safe fallback)
+        bad = np.full_like(theta, 0.0, dtype=np.float64)
+        return 1e50, np.asfortranarray(bad)
+
+    # negative log-likelihood
+    loss_ll = np.sum(fp - xlogy(meas, fp))
+
+    # latent prior on xi_w ~ N(0, I)
+    loss_lp_xi = 0.5 * np.sum(xi_w**2)
+
+    # optional Gaussian prior on b in the constrained space
+    loss_lp_b = 0.0
+    if (b_prior_mean is not None) and (b_prior_std is not None) and (b_prior_std > 0):
+        z = (b - b_prior_mean) / b_prior_std
+        loss_lp_b = 0.5 * z * z
+
+    # Jacobian for b = exp(b_tilde):
+    # log posterior has + b_tilde; negative log posterior adds - b_tilde
+    loss_jac_b = - b_tilde
+
+    # -------- gradients --------
+    # dL/df
+    dLdf = 1.0 - (meas / fp)                           # (n_poses,)
+
+    # df/dxi via inverse link gradient
+    dfdxi = (
+        1.0 / (np.sqrt(2.0 * np.pi * cov_diag) * lam)
+        * np.exp(lam * x - xi**2 / (2.0 * cov_diag))
+    )                                                  # (n_vox, 1)
+
+    # grad wrt xi_w:
+    # g_x = (sys_mat^T @ dLdf) * dfdxi   -> (n_vox, 1)
+    g_x = sys_mat.T @ dLdf.reshape(-1, 1)
+    g_x *= dfdxi
+    # chain through xi = chol_cov @ xi_w, and add d/d xi_w of 0.5||xi_w||^2
+    grad_xi_w = (g_x.T @ chol_cov + xi_w.reshape(1, -1)).ravel()
+
+    # grad wrt b:
+    # df/db = measurement_time
+    dL_db = np.dot(dLdf, measurement_time)            # scalar
+    # prior on b (if any) chain through db/db_tilde = b
+    if (b_prior_mean is not None) and (b_prior_std is not None) and (b_prior_std > 0):
+        d_prior_db = (b - b_prior_mean) / (b_prior_std**2)
+        dL_db += d_prior_db
+    # chain rule to b_tilde: db/db_tilde = b
+    grad_b_tilde = dL_db * b
+    # add Jacobian term derivative d(-b_tilde)/d b_tilde = -1
+    grad_b_tilde += -1.0
+
+    # total loss
+    total_loss = float(loss_ll + loss_lp_xi + loss_lp_b + loss_jac_b)
+
+    # concatenate gradient
+    grad = np.empty(n_vox + 1, dtype=np.float64)
+    grad[:n_vox] = grad_xi_w
+    grad[n_vox]  = grad_b_tilde
+
+    # SciPy-safe: float64, 1D, Fortran contiguous
+    grad = np.asarray(grad, dtype=np.float64).ravel(order="F")
+    grad = np.asfortranarray(grad)
+
+    return (total_loss, grad.ravel())
+
