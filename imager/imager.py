@@ -24,7 +24,8 @@ class Imager:
         self.recon_img = None
         self.use_svd = use_svd
         self.sys_mat_rank = rank
-        self.sys_mat = SYS_MAT(scenario.sys_mat, use_svd=use_svd, rank=self.sys_mat_rank)
+        self.sys_mat = scenario.sys_mat
+        # self.sys_mat = SYS_MAT(scenario.sys_mat, use_svd=use_svd, rank=self.sys_mat_rank)
 
     def MLEM_recon(self, itr=None, use_bkg=False, draw_img=False):
         """Perform MLEM/regularized reconstruction
@@ -175,6 +176,7 @@ class Imager:
         if verbose:
             print(f"Covariance construction time {cov_t_finish-cov_t_start:.2f}s")
         # For numerical stability, add eps diagonally and bump up the eigenvalues
+
         if chol_cov is None:
             cholesky_t_start = time.time()
             if kronecker is True:
@@ -185,15 +187,19 @@ class Imager:
             #print(f"Covariance matrix size {self.cov.shape}")
             if verbose:
                 print(f"Cholesky decomposition time {cholesky_t_finish-cholesky_t_start:.2f}s")
-            if start_from_prev is True:
-                xi_w_init = self.xi_w.ravel() 
-            else:
-                xi_w_init = np.random.normal(size=(self.scenario.n_vox))
+
+        # concatenate theta0 = [xi_w, b_tilde]
+        xi_w_init = np.random.normal(size=(self.scenario.n_vox,)) if not start_from_prev else self.xi_w.ravel()
+        b0 = float(getattr(self, "b_prior_mean", 1))
+        b_tilde_init = np.log(max(b0, 1e-30))
+        theta0 = np.concatenate([xi_w_init, np.array([b_tilde_init], dtype=np.float64)])
+
         opt_t_start = time.time()
         result = minimize(
-            fun=gpp_f,
-            x0=xi_w_init,
-            args=(self.meas, sigma, lam, self.cov, chol_cov, cov_diag, self.sys_mat, kronecker),
+            fun=gpp_f_with_b,
+            x0=theta0,
+            args=(self.meas, sigma, lam, self.cov, chol_cov, cov_diag, self.sys_mat, kronecker, self.scenario.int_time, 
+                 1, 1,),
             method="L-BFGS-B",
             # bounds = Bounds(0, np.inf, keep_feasible=False),
             jac=True,
@@ -205,15 +211,22 @@ class Imager:
         opt_t_finish = time.time()
         if verbose:
             print(f"Optimization time is {opt_t_finish-opt_t_start:.2f}")
-        xi = chol_cov @ result.x.reshape(-1, 1)
-        xi = xi if kronecker is False else xi.reshape(-1, 1)
-        reconed_img = inv_link(
-            lam, xi, self.cov, cov_diag=cov_diag
-        ).reshape(-1, 1)
-        self.fp = self.sys_mat @ reconed_img
+
+        xi_w_opt    = result.x[:self.scenario.n_vox]
+        b_tilde_opt = result.x[self.scenario.n_vox]
+        b_opt       = np.exp(b_tilde_opt)
+        xi = chol_cov @ xi_w_opt.reshape(-1, 1)
+        xi = xi if not kronecker else xi.reshape(-1, 1)
+        reconed_img = inv_link(lam, xi, self.cov, cov_diag=cov_diag).reshape(-1, 1)
+        t = np.asarray(self.scenario.int_time).reshape(-1)  # ensure 1D for broadcasting
+        self.fp = (self.sys_mat @ reconed_img).reshape(-1) + b_opt * t
         self.recon_img = DistributedSource(src_str=reconed_img.sum() / 3.7e10)
         self.recon_img.src_dist = np.reshape(reconed_img, self.scenario.dims) / 3.7e10
-        self.xi_w = result.x.reshape(-1, 1)
+        self.xi_w = xi_w_opt.reshape(-1, 1)
+        self.b_tilde = float(b_tilde_opt)
+        self.b_opt = float(b_opt)
+
+
         if draw_img is True:
             draw_2D_img(self.scenario, srcs=[self.recon_img])
         # TODO the following return will be removed
@@ -221,6 +234,7 @@ class Imager:
             "img": np.reshape(reconed_img, self.scenario.dims),
             "xi": np.reshape(xi, self.scenario.dims),
             "xi_w": self.xi_w,
+            "b":self.b_opt,
             "cov": self.cov,
             "chol_cov": chol_cov,
             "cov_size": self.cov.shape,
@@ -675,154 +689,92 @@ def pcn_acceptance_prob(u, v, lam, cov_diag, meas, sys_mat):
     return np.minimum(1, np.exp(I_u - I_v))
 
 
-# Loss function for the gpp algorithm
-def gpp_f(xi_w, meas, sigma, lam, cov, chol_cov, cov_diag, sys_mat, kronecker):
-    # xi_w is an 1d array
-    xi = chol_cov @ xi_w.reshape(-1, 1)
-    xi = xi.reshape(-1,1) if kronecker is True else xi
-    x = inv_link(lam, xi, cov, cov_diag=cov_diag)
-    fp = sys_mat @ x
-    # loss log-likelihood
-    loss_ll = np.sum(fp - xlogy(meas, fp))
-    loss_lp = 0.5 * np.sum(xi_w**2)
-    # Compute the gradient
-    # Old way - slower
-    #dLdf = np.sum(sys_mat.T, axis=1, keepdims=True) - sys_mat.T @ (meas / fp)
-    # New way - faster
-    dLdf = sys_mat.T @ (1-(meas / fp))
-
-   
-    # below is the gradient of the inverse link function with the infinite support laplacian distribution
-    # dfdxi = 1/(2*lam)*norm.pdf(xi, scale=cov_diag)/norm.cdf(-1*np.abs(xi), scale=cov_diag)
-    # dfdxi = (1/(np.sqrt(np.pi*2*cov_diag)) * np.exp(-1*xi**2/(2*cov_diag)))/(lam*(1-np.sign(xi)*erf(xi/(np.sqrt(2)*cov_diag))))
-    # below is the gradient of the inverse link function with the non-negative support laplacian distribution (exponential distribution)
-    dfdxi = (
-        1
-        / (np.sqrt(2 * np.pi * cov_diag) * lam)
-        * np.exp(lam * x - xi**2 / (2 * cov_diag))
-    )
-    dxidxiw = chol_cov
-    grad = ((dLdf * dfdxi).T @ dxidxiw + xi_w.T).T
-    #print(x.shape)
-    # print(f"ll loss:{loss_ll:.2f}, lp loss{loss_lp:.2f}, total loss{loss_ll+loss_lp:.2f}")
-
-    # ---- PATCH START ----
-    # Ensure scalar loss is Python float
-    total_loss = float(loss_ll + loss_lp)
-
-    # Ensure gradient is 1D float64 Fortran-contiguous array
-    grad = np.asarray(grad, dtype=np.float64).ravel(order="F")
-    grad = np.asfortranarray(grad)
-
-    # Safety checks
-    if grad.ndim != 1:
-        raise ValueError(f"Gradient must be 1D, got shape {grad.shape}")
-    if grad.size != xi_w.size:
-        raise ValueError(f"Gradient length {grad.size} != parameter length {xi_w.size}")
-    # ---- PATCH END ----
-
-    return (total_loss, grad.ravel())
-
-
 def inv_link(lam, xi, cov, cov_diag=None):
     cov_diag = cov_diag if cov_diag is not None else np.reshape(np.diag(cov), (-1, 1))
     # log_ndtr for numerical stability instead of the error funciton
     return -1 / lam * log_ndtr(-xi)
 
-
-def gpp_f_with_b(theta, meas, sigma, lam, cov, chol_cov, cov_diag,
-                       sys_mat, measurement_time, kronecker,
-                       b_prior_mean=None, b_prior_std=None):
+    
+# Loss function for the gpp algorithm
+def gpp_f_with_b(
+    theta,
+    meas,
+    sigma,                # kept for API parity
+    lam,
+    cov,
+    chol_cov,
+    cov_diag,
+    sys_mat,
+    kronecker,
+    measurement_time,
+    b_prior_mean=None,
+    b_prior_std=None,
+):
     """
-    theta: concatenated parameter vector [xi_w (n_vox), b_tilde (1)]
-    b = exp(b_tilde) >= 0
+    SciPy-friendly loss+grad for GPP with background.
+    theta = [xi_w (n_vox), b_tilde]
+    Returns (loss, grad) with grad 1D float64 Fortran-contiguous.
     """
-    theta = np.asarray(theta)
-    n_vox = chol_cov.shape[0] if not kronecker else cov.shape[0]
+    # --- cast everything to NumPy ---
+    theta = np.asarray(theta, dtype=np.float64)
+    meas  = np.asarray(meas, dtype=np.float64).reshape(-1)
+    t     = np.asarray(measurement_time, dtype=np.float64).reshape(-1)
+    A     = np.asarray(sys_mat, dtype=np.float64)
+    L     = np.asarray(chol_cov, dtype=np.float64)
+    cov_diag = np.asarray(cov_diag, dtype=np.float64)
 
+    n_vox = L.shape[0] if not kronecker else cov.shape[0]
     xi_w    = theta[:n_vox]
     b_tilde = float(theta[n_vox])
-    b       = np.exp(b_tilde)  # ensure non-negativity
-
-    # shapes (flatten to 1D where useful)
-    meas = np.asarray(meas)
-    if meas.ndim == 2 and meas.shape[1] == 1:
-        meas = meas.ravel()
-    measurement_time = np.asarray(measurement_time)
-    if measurement_time.ndim == 2 and measurement_time.shape[1] == 1:
-        measurement_time = measurement_time.ravel()
+    b       = np.exp(b_tilde)  # b >= 0
 
     # latent -> xi -> x
-    xi = chol_cov @ xi_w.reshape(-1, 1)
+    xi = L @ xi_w.reshape(-1, 1)            # (n_vox,1)
     xi = xi.reshape(-1, 1) if kronecker else xi
-    x  = inv_link(lam, xi, cov, cov_diag=cov_diag)  # (n_vox, 1) or (n_vox,)
+    x  = inv_link(lam, xi, cov, cov_diag=cov_diag)   # (n_vox,1)
 
-    # forward model with background
-    fp = sys_mat @ x                                  # (n_poses, 1) or (n_poses,)
-    fp = fp.reshape(-1) + b * measurement_time        # make 1D for algebra
+    # forward model + positivity guard
+    fp = (A @ x).reshape(-1) + b * t
+    eps = 1e-30
+    fp_safe = np.clip(fp, eps, None)
 
-    # guard against invalid Poisson means
-    if np.any(fp <= 0):
-        # huge penalty and zero grad (safe fallback)
-        bad = np.full_like(theta, 0.0, dtype=np.float64)
-        return 1e50, np.asfortranarray(bad)
-
-    # negative log-likelihood
-    loss_ll = np.sum(fp - xlogy(meas, fp))
-
-    # latent prior on xi_w ~ N(0, I)
+    # ---- loss ----
+    # Poisson NLL
+    loss_ll   = np.sum(fp_safe - xlogy(meas, fp_safe))
+    # latent prior
     loss_lp_xi = 0.5 * np.sum(xi_w**2)
-
-    # optional Gaussian prior on b in the constrained space
+    # optional Gaussian prior on b
     loss_lp_b = 0.0
     if (b_prior_mean is not None) and (b_prior_std is not None) and (b_prior_std > 0):
         z = (b - b_prior_mean) / b_prior_std
         loss_lp_b = 0.5 * z * z
+    # Jacobian for b = exp(b_tilde) (negative log-posterior)
+    loss_jac_b = -b_tilde
 
-    # Jacobian for b = exp(b_tilde):
-    # log posterior has + b_tilde; negative log posterior adds - b_tilde
-    loss_jac_b = - b_tilde
-
-    # -------- gradients --------
-    # dL/df
-    dLdf = 1.0 - (meas / fp)                           # (n_poses,)
-
-    # df/dxi via inverse link gradient
-    dfdxi = (
-        1.0 / (np.sqrt(2.0 * np.pi * cov_diag) * lam)
-        * np.exp(lam * x - xi**2 / (2.0 * cov_diag))
-    )                                                  # (n_vox, 1)
-
-    # grad wrt xi_w:
-    # g_x = (sys_mat^T @ dLdf) * dfdxi   -> (n_vox, 1)
-    g_x = sys_mat.T @ dLdf.reshape(-1, 1)
-    g_x *= dfdxi
-    # chain through xi = chol_cov @ xi_w, and add d/d xi_w of 0.5||xi_w||^2
-    grad_xi_w = (g_x.T @ chol_cov + xi_w.reshape(1, -1)).ravel()
-
-    # grad wrt b:
-    # df/db = measurement_time
-    dL_db = np.dot(dLdf, measurement_time)            # scalar
-    # prior on b (if any) chain through db/db_tilde = b
-    if (b_prior_mean is not None) and (b_prior_std is not None) and (b_prior_std > 0):
-        d_prior_db = (b - b_prior_mean) / (b_prior_std**2)
-        dL_db += d_prior_db
-    # chain rule to b_tilde: db/db_tilde = b
-    grad_b_tilde = dL_db * b
-    # add Jacobian term derivative d(-b_tilde)/d b_tilde = -1
-    grad_b_tilde += -1.0
-
-    # total loss
     total_loss = float(loss_ll + loss_lp_xi + loss_lp_b + loss_jac_b)
 
-    # concatenate gradient
+    # ---- gradients ----
+    dLdf = 1.0 - (meas / fp_safe)                         # (n_poses,)
+    # dfdxi (matches your formula)
+    dfdxi = (1.0 / (np.sqrt(2.0 * np.pi * cov_diag) * lam)) * np.exp(
+        lam * x - (xi**2) / (2.0 * cov_diag)
+    )                                                     # (n_vox,1)
+
+    # grad wrt xi_w: (A^T dLdf) * dfdxi, chain via xi = L xi_w, add xi_w
+    g_x = (A.T @ dLdf.reshape(-1, 1)) * dfdxi             # (n_vox,1)
+    grad_xi_w = (g_x.T @ L + xi_w.reshape(1, -1)).ravel()
+
+    # grad wrt b_tilde: dL/db * db/d(b_tilde) + d/d(b_tilde)(-b_tilde)
+    dL_db = np.dot(dLdf, t)                               # scalar from likelihood
+    if (b_prior_mean is not None) and (b_prior_std is not None) and (b_prior_std > 0):
+        dL_db += (b - b_prior_mean) / (b_prior_std**2)    # prior on b
+    grad_b_tilde = dL_db * b + (-1.0)                     # chain + Jacobian
+
+    # pack gradient
     grad = np.empty(n_vox + 1, dtype=np.float64)
     grad[:n_vox] = grad_xi_w
     grad[n_vox]  = grad_b_tilde
-
-    # SciPy-safe: float64, 1D, Fortran contiguous
-    grad = np.asarray(grad, dtype=np.float64).ravel(order="F")
-    grad = np.asfortranarray(grad)
+    grad = np.asfortranarray(grad.ravel(order="F"))       # SciPy L-BFGS-B friendly
 
     return (total_loss, grad.ravel())
 
