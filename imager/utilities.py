@@ -37,8 +37,8 @@ mpl.rcParams["axes.prop_cycle"] = cycler.cycler("color", tab10_rgb)
 # matplotlib RC parameters
 plt.rcParams.update({"font.size": 30})
 
-from scipy.interpolate.interpnd import _ndim_coords_from_arrays
-from scipy.interpolate._bsplines import make_interp_spline
+# from scipy.interpolate.interpnd import _ndim_coords_from_arrays
+# from scipy.interpolate._bsplines import make_interp_spline
 
 def _check_points(points):
     descending_dimensions = []
