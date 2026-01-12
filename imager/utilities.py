@@ -37,7 +37,24 @@ mpl.rcParams["axes.prop_cycle"] = cycler.cycler("color", tab10_rgb)
 # matplotlib RC parameters
 plt.rcParams.update({"font.size": 30})
 
-from scipy.interpolate.interpnd import _ndim_coords_from_arrays
+def _ndim_coords_from_arrays(points, ndim=None):
+    """
+    Minimal replacement for SciPy's private _ndim_coords_from_arrays.
+    Accepts a tuple/list of coordinate arrays or an (npoints, ndim) array.
+    Returns array of shape (npoints, ndim).
+    """
+    if isinstance(points, (list, tuple)):
+        pts = [np.asarray(p) for p in points]
+        pts = np.broadcast_arrays(*pts)
+        coords = np.stack([p.ravel() for p in pts], axis=-1)
+        return coords
+    pts = np.asarray(points)
+    if pts.ndim == 1:
+        if ndim is None:
+            raise ValueError("ndim must be provided when points is 1D")
+        pts = pts.reshape(-1, ndim)
+    return pts
+
 from scipy.interpolate._bsplines import make_interp_spline
 
 def _check_points(points):
